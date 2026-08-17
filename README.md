@@ -1,5 +1,7 @@
 # job-radar
 
+![](images/preview.png)
+
 Multi-source technical job board monitor: polls several boards, scores listings against a
 weighted keyword model, dedups across runs, and pushes only the *new* matches to a webhook.
 
