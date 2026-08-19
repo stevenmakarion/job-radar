@@ -54,6 +54,36 @@ KEYWORDS = {
 # things we are deliberately not chasing
 NEGATIVE = ("wordpress theme", "logo design", "graphic design", "data entry",
             "virtual assistant", "social media manager", "video editor")
+
+# THE TWO FILTERS THAT MADE THIS USABLE (2026-08-19).
+# A first real run returned 25 "matches" of which 4 were live opportunities. The
+# rest were either months stale or other freelancers ADVERTISING. Scoring alone
+# cannot tell those apart: a competitor's ad and a client's brief contain the
+# same keywords. So classify the intent and check the clock before scoring.
+MAX_AGE_DAYS = 21          # a jobs post older than this is filled or dead
+SELLER = re.compile(r"\[?\s*(for\s*hire|available\s+for|open\s+to\s+work|"
+                    r"offering|i\s+can\s+build|my\s+services)", re.I)
+BUYER  = re.compile(r"\[?\s*(hiring|we.re\s+hiring|need(ed)?\b|seeking|looking\s+for|"
+                    r"wanted|willing\s+to\s+pay|paid\s+(project|gig|pilot))", re.I)
+
+
+def classify(title):
+    """SELLER beats BUYER: '[FOR HIRE] ... looking for clients' is an ad."""
+    if SELLER.search(title):
+        return "seller"
+    if BUYER.search(title):
+        return "buyer"
+    return "unknown"
+
+
+def age_days(posted):
+    """posted is YYYY-MM-DD or ''. Unknown age is NOT treated as fresh."""
+    if not posted:
+        return None
+    try:
+        return (datetime.now() - datetime.strptime(posted[:10], "%Y-%m-%d")).days
+    except Exception:
+        return None
 MONEY = re.compile(r"[$€£]\s?([\d,]{2,7})(?:\s?[-–]\s?[$€£]?([\d,]{2,7}))?")
 
 
@@ -91,6 +121,9 @@ def source_n8n():
                 "title": t.get("title", ""),
                 "url": f"https://community.n8n.io/t/{t.get('slug')}/{t.get('id')}",
                 "posted": t.get("created_at", "")[:10],
+                # replies == how many people you are bidding against. A 7-day-old
+                # post with 4 replies is a better target than a 1-day-old with 40.
+                "replies": max(0, (t.get("posts_count") or 1) - 1),
             })
     except Exception as e:
         print(f"  n8n source failed: {e}", file=sys.stderr)
@@ -129,14 +162,23 @@ def score(item):
     t = item["title"].lower()
     if any(n in t for n in NEGATIVE):
         return 0, []
+    item["kind"] = classify(item["title"])
+    item["age"] = age_days(item.get("posted", ""))
     hits = [(k, w) for k, w in KEYWORDS.items() if k in t]
     s = sum(w for _, w in hits)
-    if item["title"].lower().startswith("[hiring]") or "hiring" in t:
-        s += 2                       # they are buying, not selling
+    if item["kind"] == "buyer":
+        s += 3                       # they are buying, not selling
     m = MONEY.search(item["title"])
     if m:
         s += 2
         item["money"] = m.group(0)
+    # low competition is signal, and it is the one thing scoring usually ignores
+    r = item.get("replies")
+    if r is not None:
+        if r <= 5:
+            s += 2
+        elif r >= 25:
+            s -= 2
     return s, [k for k, _ in hits]
 
 
@@ -156,8 +198,17 @@ def notify(lines):
     """Telegram push — the same 'tell a human only when it matters' pattern we
     use for production monitoring."""
     try:
-        tok = open(os.path.expanduser("~/.config/telegram-token")).read().strip()
-        chat = open(os.path.expanduser("~/.config/telegram-chatid")).read().strip()
+        # Try both names. The original hard-coded a path that did not exist on
+        # this host, so --notify failed to stderr and the run still exited 0 --
+        # a notifier that notified nobody, silently. Fail LOUD instead.
+        def _cred(*names):
+            for n in names:
+                p = os.path.expanduser(n)
+                if os.path.exists(p):
+                    return open(p).read().strip()
+            raise FileNotFoundError(" / ".join(names))
+        tok = _cred("~/.config/aria-telegram-token", "~/.config/telegram-token")
+        chat = _cred("~/.config/aria-telegram-chatid", "~/.config/telegram-chatid")
         body = json.dumps({"chat_id": chat, "text": "\n".join(lines)[:3900],
                            "disable_web_page_preview": True}).encode()
         req = urllib.request.Request(
@@ -175,16 +226,28 @@ def main():
     ap.add_argument("--min-score", type=int, default=3)
     ap.add_argument("--notify", action="store_true")
     ap.add_argument("--all", action="store_true", help="ignore the seen-list")
+    ap.add_argument("--max-age", type=int, default=MAX_AGE_DAYS,
+                    help="drop listings older than this many days")
+    ap.add_argument("--include-sellers", action="store_true",
+                    help="keep other freelancers' ads (off by default)")
     a = ap.parse_args()
 
     seen = set() if a.all else load_seen()
     found, fresh = [], []
+    dropped = {"seller": 0, "stale": 0, "low-score": 0}
     for src in SOURCES:
         items = src()
         print(f"{src.__name__}: {len(items)} listings")
         for it in items:
             s, hits = score(it)
+            if it.get("kind") == "seller" and not a.include_sellers:
+                dropped["seller"] += 1
+                continue
+            if it.get("age") is not None and it["age"] > a.max_age:
+                dropped["stale"] += 1
+                continue
             if s < a.min_score:
+                dropped["low-score"] += 1
                 continue
             it["score"], it["hits"] = s, hits
             found.append(it)
@@ -193,12 +256,17 @@ def main():
                 fresh.append(it)
                 seen.add(key)
 
-    found.sort(key=lambda x: -x["score"])
-    print(f"\n{len(found)} matches (>= {a.min_score}), {len(fresh)} new\n")
+    found.sort(key=lambda x: (-x["score"], x.get("replies") if x.get("replies") is not None else 99,
+                              x.get("age") if x.get("age") is not None else 99))
+    print(f"\n{len(found)} live opportunities (>= {a.min_score}), {len(fresh)} new")
+    print(f"   filtered out: {dropped['seller']} seller ads, {dropped['stale']} stale "
+          f"(> {a.max_age}d), {dropped['low-score']} below score\n")
     for it in found[:25]:
         money = f"  [{it.get('money')}]" if it.get("money") else ""
-        print(f"  {it['score']:2d}  {it['source']:10s} {it['title'][:88]}{money}")
-        print(f"      {it['url']}")
+        age = f"{it['age']}d" if it.get("age") is not None else " ? "
+        rep = f"{it['replies']:>2} bids" if it.get("replies") is not None else "      "
+        print(f"  {it['score']:2d}  {age:>4} {rep}  {it['source']:10s} {it['title'][:74]}{money}")
+        print(f"                         {it['url']}")
 
     if a.notify and fresh:
         lines = [f"🎯 JOB RADAR — {len(fresh)} new match(es) "
